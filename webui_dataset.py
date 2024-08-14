@@ -3,6 +3,7 @@ import os
 
 import gradio as gr
 import yaml
+import time
 
 from common.log import logger
 from common.subprocess_utils import run_script_with_log
@@ -19,11 +20,22 @@ dataset_root = ".\\raw\\"
 
 
 
+
+
+# 字幕语音切分
+inference_pipeline = pipeline(
+    task=Tasks.auto_speech_recognition,
+    model='damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch',
+    vad_model='damo/speech_fsmn_vad_zh-cn-16k-common-pytorch',
+    punc_model='damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch',
+    ncpu=16,
+)
 sd_pipeline = pipeline(
     task='speaker-diarization',
     model='damo/speech_campplus_speaker-diarization_common',
     model_revision='v1.0.0'
 )
+audio_clipper = VideoClipper(inference_pipeline, sd_pipeline)
 
 def audio_change(audio):
 
@@ -45,23 +57,34 @@ def audio_change(audio):
 
     return (16000,audio_data)
 
-def write_list(text,audio):
+def audio_change_by_path(file_path):
+
+    if os.path.exists(file_path):
+        # 加载音频文件
+        y, sr = librosa.load(file_path, sr=16000)
+        audio_data = np.array(y)
+        print(y, sr)
+        return (sr, audio_data)
+    else:
+        return None
+
+
+def write_list(text,audio,clip_audio_output_dir):
     
-    random_number = random.randint(10000, 99999)
+    random_number = int(time.time())
 
-    wav_name = f'./wavs/sample_{random_number}.wav'
+    wav_path = os.path.join(clip_audio_output_dir,  f'clip_{random_number}.wav')
 
-    sf.write(wav_name, audio[1], audio[0], 'PCM_24')
+    sf.write(wav_path, audio[1], audio[0], 'PCM_24')
 
     text = text.replace("#",",")
 
-    with open("./esd.list","a",encoding="utf-8")as f:f.write(f"\n{wav_name}|sample|en|{text}")
+    with open("./esd.list","a",encoding="utf-8")as f:f.write(f"\n{wav_path}|sample|en|{text}")
+    return wav_path
 
-
-
-
-def audio_recog(audio_input, sd_switch):
-    print(audio_input)
+def audio_recog(audio_input_path, sd_switch):
+    # 音频文件转换
+    audio_input = audio_change_by_path(audio_input_path)
     return audio_clipper.recog(audio_input, sd_switch)
 
 def audio_clip(dest_text, audio_spk_input, start_ost, end_ost, state):
@@ -69,14 +92,18 @@ def audio_clip(dest_text, audio_spk_input, start_ost, end_ost, state):
 
 # 音频降噪
 
-def reset_tts_wav(audio):
+def reset_tts_wav(audio, denoise_output_dir):
 
     ans = pipeline(
     Tasks.acoustic_noise_suppression,
     model='damo/speech_frcrn_ans_cirm_16k')
-    ans(audio,output_path='./output_ins.wav')
+    
+    timestamp = int(time.time())
+    
+    output_file_path = os.path.join(denoise_output_dir, f"denoise_{timestamp}.wav")
+    ans(audio,output_path=output_file_path)
 
-    return "./output_ins.wav","./output_ins.wav"
+    return output_file_path, output_file_path
 
 
 def do_slice(
@@ -203,11 +230,6 @@ def do_transcribe_all(
 
 
 initial_md = """
-
-请把格式为 角色名.wav 的素材文件放入项目的raw目录
-
-作者：刘悦的技术博客  https://space.bilibili.com/3031494
-
 """
 
 with gr.Blocks(theme="NoCrypt/miku") as app:
@@ -219,10 +241,12 @@ with gr.Blocks(theme="NoCrypt/miku") as app:
         with gr.Row():
             audio_inp_path = gr.Audio(label="请上传克隆对象音频", type="filepath")
             reset_inp_button = gr.Button("针对原始素材进行降噪", variant="primary",visible=True)
-            reset_dataset_path = gr.Textbox(label="降噪后音频地址",placeholder="降噪后生成的音频地址")
+            with gr.Column():
+                denoise_output_dir = gr.Textbox(label="🔊降噪输出文件夹 Audio Output Directory",placeholder="/mnt/worksapce/")
+                reset_dataset_path = gr.Textbox(label="降噪后音频地址",placeholder="降噪后生成的音频地址")
 
         
-    reset_inp_button.click(reset_tts_wav,[audio_inp_path],[audio_inp_path,reset_dataset_path])
+    reset_inp_button.click(reset_tts_wav,[audio_inp_path, denoise_output_dir],[audio_inp_path,reset_dataset_path])
     
     with gr.Accordion("音频素材切割"):
         with gr.Row():
@@ -246,31 +270,70 @@ with gr.Blocks(theme="NoCrypt/miku") as app:
                 slice_button = gr.Button("开始切分")
             result1 = gr.Textbox(label="結果")
 
-    
-
-
-    with gr.Accordion("音频批量转写，转写文件存放在根目录的est.list"):
+    with gr.Accordion("音频素材手动按字幕切割"):
+        audio_state = gr.State()
         with gr.Row():
             with gr.Column():
-                
-                language = gr.Dropdown(["ja", "en", "zh","ko","yue"], value="zh", label="选择转写的语言")
+                # oaudio_input = gr.Audio(label="🔊音频输入 44100hz Audio Input",type="filepath")
+                # rec_audio = gr.Button("👂重新采样")
+                # audio_input = gr.Audio(label="🔊音频输入 16000hz Audio Input")
+                audio_input = gr.Textbox(label="🔊音频输入路径 Audio File Path")
+                audio_sd_switch = gr.Radio(["no", "yes"], label="👥是否区分说话人 Recognize Speakers", value='no')
+                recog_button1 = gr.Button("👂识别 Recognize")
+                audio_text_output = gr.Textbox(label="✏️识别结果 Recognition Result")
+                audio_srt_output = gr.Textbox(label="📖SRT字幕内容 RST Subtitles")
+            with gr.Column():
+                audio_text_input = gr.Textbox(label="✏️待裁剪文本 Text to Clip (多段文本使用'#'连接)")
+                audio_spk_input = gr.Textbox(label="✏️待裁剪说话人 Speaker to Clip (多个说话人使用'#'连接)")
+                with gr.Row():
+                    audio_start_ost = gr.Slider(minimum=-500, maximum=1000, value=0, step=50, label="⏪开始位置偏移 Start Offset (ms)")
+                    audio_end_ost = gr.Slider(minimum=-500, maximum=1000, value=0, step=50, label="⏩结束位置偏移 End Offset (ms)")
+                with gr.Row():
+                    with gr.Column():
+                        clip_audio_output_dir = gr.Textbox(label="🔊转写音频输出文件夹")
+                        clip_audio_output_path = gr.Textbox(label="转写音频地址",placeholder="转写音频生成的地址")
+                        with gr.Row():
+                            clip_button1 = gr.Button("✂️裁剪 Clip")
+                            write_button1 = gr.Button("写入转写文件")
+                audio_output = gr.Audio(label="🔊裁剪结果 Audio Clipped")
+                audio_mess_output = gr.Textbox(label="ℹ️裁剪信息 Clipping Log")
+                audio_srt_clip_output = gr.Textbox(label="📖裁剪部分SRT字幕内容 Clipped RST Subtitles")
 
-                mytype = gr.Dropdown(["small","medium","large-v3","large-v2"], value="medium", label="选择Whisper模型")
+            # audio_input.change(inputs=audio_input, outputs=audio_input, fn=audio_change_by_path)
 
-                input_file = gr.Textbox(label="切片所在目录",placeholder="不填默认为./wavs目录")
-                
-                file_pos = gr.Textbox(label="切片名称前缀",placeholder="不填只有切片文件名")
-                
-            transcribe_button_whisper = gr.Button("Whisper开始转写")
-
-            transcribe_button_fwhisper = gr.Button("Faster-Whisper开始转写")
-
-            transcribe_button_ali = gr.Button("阿里SenseVoice开始转写")
-
-            transcribe_button_bcut = gr.Button("必剪ASR开始转写")
+            write_button1.click(write_list,[audio_text_input,audio_output,clip_audio_output_dir],[clip_audio_output_path])
+            
+            # rec_audio.click(re_write,[oaudio_input],[rec_audio])
+            recog_button1.click(audio_recog, 
+                            inputs=[audio_input, audio_sd_switch],
+                            outputs=[audio_text_output, audio_srt_output, audio_state])
+            clip_button1.click(audio_clip, 
+                            inputs=[audio_text_input, audio_spk_input, audio_start_ost, audio_end_ost, audio_state], 
+                            outputs=[audio_output, audio_mess_output, audio_srt_clip_output])
 
 
-            result2 = gr.Textbox(label="結果")
+
+    with gr.Row():
+        with gr.Column():
+            
+            language = gr.Dropdown(["ja", "en", "zh"], value="zh", label="选择转写的语言")
+
+            mytype = gr.Dropdown(["small","medium","large-v3","large-v2"], value="medium", label="选择Whisper模型")
+
+            input_file = gr.Textbox(label="切片所在目录",placeholder="不填默认为./wavs目录")
+            
+            file_pos = gr.Textbox(label="切片名称前缀",placeholder="不填只有切片文件名")
+            
+        transcribe_button_whisper = gr.Button("Whisper开始转写")
+
+        transcribe_button_fwhisper = gr.Button("Faster-Whisper开始转写")
+
+        transcribe_button_ali = gr.Button("阿里ASR开始转写")
+
+        transcribe_button_bcut = gr.Button("必剪ASR开始转写")
+
+
+        result2 = gr.Textbox(label="結果")
 
     slice_button.click(
         do_slice,
