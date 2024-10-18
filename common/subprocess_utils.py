@@ -3,6 +3,7 @@ import sys
 
 from .log import logger
 from .stdout_wrapper import SAFE_STDOUT
+from typing import List, Tuple
 
 
 #python = ".\\venv\\python.exe"
@@ -11,7 +12,7 @@ python = "python3"
 print(python)
 
 
-def run_script_with_log(cmd: list[str], ignore_warning=False) -> tuple[bool, str]:
+def run_script_with_log(cmd: List[str], ignore_warning: bool = False) -> Tuple[bool, str]:
     logger.info(f"Running: {' '.join(cmd)}")
     print([python] + cmd)
 
